@@ -1,0 +1,16 @@
+# The virtualenv is gigabytes and is rebuilt inside the image anyway. Without
+# this line the build context alone takes minutes to upload.
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets never go in an image. Supply them at runtime (env_file / a secret
+# manager), so the same image is safe to push anywhere.
+.env
+
+.git/
+.gitignore
+.DS_Store
+*.db
+*.db-journal
