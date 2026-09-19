@@ -1,0 +1,4 @@
+[
+  {"provider": "IRCTC", "name": "Shatabdi Express", "durationMinutes": 275, "priceInr": 1240},
+  {"provider": "IRCTC", "name": "Double Decker",    "durationMinutes": 290, "priceInr": 890}
+]
