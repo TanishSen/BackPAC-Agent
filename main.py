@@ -1,78 +1,125 @@
-"""BackPAC agent runtime — the process that puts a voice bot into a room.
+"""BackPAC agent runtime — the process that puts a voice bot into a LiveKit room.
 
-HTTP surface (same shape as the ajimganj concierge):
+HTTP surface (called by BackPAC-BE, mirrors the ajimganj concierge):
   GET  /             health
-  POST /start        join a LiveKit room and start talking      (called by BE)
+  POST /start        join a room and start the voice loop
   POST /stop         end a session
   GET  /sessions     list running sessions
 
-Run it with:  uvicorn main:app --reload --port 8080
-(or `python main.py`)
+Run:  python main.py         (or  uvicorn main:app --port 8080)
 
-The flow, end to end:
+End-to-end flow:
   BackPAC-BE mints a LiveKit room + token, then calls POST /start here with the
-  room name. This service joins that room as a bot, runs the voice pipeline
-  (STT -> LangGraph brain -> ElevenLabs TTS), and talks to whoever the app put
-  in the room with the token.
+  room name. This service joins that room, builds the pipeline
+  (STT → trip brain → ElevenLabs TTS), and talks to whoever joined with the
+  app's token. Agent replies and transcripts are pushed back to the app over
+  the LiveKit data channel (see WordInterceptor / CardDispatcher).
 
-This file is intentionally the only place Pipecat/LiveKit transport is set up.
-The brain (src/bot/core) and the voice stages (src/bot/processors) stay
-testable without it.
+Everything Pipecat/LiveKit is confined to this file; the brain (src/bot/core)
+and the voice stages (src/bot/processors) stay importable and testable on their
+own.
 """
 
 import asyncio
 import logging
 import os
+import uuid
 
 import aiohttp
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.workers.runner import WorkerRunner
 
-from config.settings import GREETING_MESSAGE, PARTICIPANT_NAME
-from models.bot import StartRequest, StartResponse, StopRequest
+from config.env import load_env, require, voice_requirements
+
+# Before any other import that reads os.getenv. Pinned to the project root, so
+# it works however the process was launched. See config/env.py.
+load_env()
+
+from models.bot import (  # noqa: E402
+    SpokenLine,
+    WelcomeLinesResponse,
+    StartRequest,
+    StartResponse,
+    StopRequest,
+)
 from src.bot.core.coordinator import build_graph
+from src.bot.infrastructure.events import (
+    setup_event_handlers,
+    setup_user_aggregator_handlers,
+)
+from src.bot.infrastructure.transport import create_transport
 from src.bot.processors.langgraph_processor import LangGraphProcessor
-from src.bot.processors.pipeline import build_stt, build_tts, create_pipeline
+from src.bot.processors.pipeline import create_pipeline, create_services
+from src.bot.voice.greeting import FRAME_MS, get_greeting, get_welcome_lines
 
-load_dotenv()
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger("backpac-agent")
 
-app = FastAPI(title="BackPAC Agent", version="0.1.0")
+# Die now, with a readable message, rather than accepting a /start and failing
+# three layers deep inside a provider SDK once someone is already on the call.
+require(*voice_requirements())
 
-# session_id -> asyncio.Task running that bot.
+app = FastAPI(title="BackPAC Agent", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# session_id -> the asyncio Task running that bot.
 running: dict[str, asyncio.Task] = {}
 
 
 async def run_bot(room_name: str, session_id: str) -> None:
-    """Join the room and run the pipeline until the session ends.
+    """Join the room and run the pipeline until the session ends or is cancelled."""
+    # One graph per call. It carries its own checkpointer (memory), keyed by the
+    # room name inside the processor, so the conversation survives a reconnect.
+    graph = build_graph()
 
-    The LiveKit connection details come from the environment (LIVEKIT_URL /
-    _API_KEY / _API_SECRET) — the same project BackPAC-BE minted the room in.
-    """
-    from pipecat.runner.livekit import configure
-    from pipecat.pipeline.runner import PipelineRunner
-    from pipecat.pipeline.task import PipelineTask
-    from pipecat.frames.frames import TTSSpeakFrame
-
-    # `configure` reads LIVEKIT_* from env and returns a transport bound to the
-    # room. This is the single spot LiveKit is touched.
-    transport = await configure(room_name=room_name, participant_name=PARTICIPANT_NAME)
+    transport, aic_filter = create_transport(room_name)
 
     async with aiohttp.ClientSession() as http:
-        stt = build_stt()
-        tts = build_tts(http)
-        graph = build_graph()
-        brain = LangGraphProcessor(graph, room_name)
+        stt, tts = create_services(
+            voice_id=os.getenv("ELEVENLABS_VOICE_ID"),
+            aiohttp_session=http,
+        )
 
-        pipeline = create_pipeline(transport, stt, tts, brain)
-        task = PipelineTask(pipeline)
+        brain = LangGraphProcessor(graph, room_name=room_name)
+        pipeline, aggregators, word_interceptor = create_pipeline(
+            transport, aic_filter, stt, tts, brain, room_name
+        )
+        # The brain publishes user transcripts through the same data-channel
+        # interceptor the pipeline uses for agent text.
+        brain._word_interceptor = word_interceptor
 
-        # Greet as soon as the bot is in the room, before the user speaks.
-        await task.queue_frame(TTSSpeakFrame(GREETING_MESSAGE))
+        worker = PipelineWorker(
+            pipeline,
+            params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+            idle_timeout_secs=900,
+        )
+        setup_event_handlers(transport, worker, brain, room_name=room_name)
+        setup_user_aggregator_handlers(aggregators.user())
+
+        runner = WorkerRunner()
+        await runner.add_workers(worker)
 
         logger.info("[%s] bot running in room %s", session_id, room_name)
-        await PipelineRunner().run(task)
+        try:
+            await runner.run()
+        except asyncio.CancelledError:
+            logger.info("[%s] cancelling; cleaning up", session_id)
+            try:
+                await asyncio.wait_for(worker.cancel(), timeout=5.0)
+            except (TimeoutError, Exception) as exc:  # noqa: BLE001
+                logger.warning("[%s] cleanup issue: %s", session_id, exc)
+            raise
 
 
 async def _session(room_name: str, session_id: str) -> None:
@@ -80,7 +127,7 @@ async def _session(room_name: str, session_id: str) -> None:
         await run_bot(room_name, session_id)
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 — log and clean up, never leak a task
+    except Exception:  # noqa: BLE001 — log, never leak a dead task
         logger.exception("[%s] session crashed", session_id)
     finally:
         running.pop(session_id, None)
@@ -94,12 +141,12 @@ async def health() -> dict:
 
 @app.post("/start", response_model=StartResponse)
 async def start(request: StartRequest) -> StartResponse:
-    if request.session_id in running and not running[request.session_id].done():
-        raise HTTPException(409, f"session {request.session_id} already running")
-
-    task = asyncio.create_task(_session(request.room_name, request.session_id))
-    running[request.session_id] = task
-    return StartResponse(session_id=request.session_id)
+    session_id = request.session_id or str(uuid.uuid4())
+    if session_id in running and not running[session_id].done():
+        raise HTTPException(409, f"session {session_id} already running")
+    running[session_id] = asyncio.create_task(_session(request.room_name, session_id))
+    logger.info("started session %s for room %s", session_id, request.room_name)
+    return StartResponse(session_id=session_id)
 
 
 @app.post("/stop")
@@ -109,6 +156,53 @@ async def stop(request: StopRequest) -> dict:
         raise HTTPException(404, f"session {request.session_id} not found")
     task.cancel()
     return {"status": "stopping", "session_id": request.session_id}
+
+
+@app.get("/greeting", response_model=SpokenLine)
+async def greeting(text: str | None = None) -> SpokenLine:
+    """The spoken hello for the welcome screen, with a level track for the orb.
+
+    Not a call: no room, no session, no microphone permission. Synthesising here
+    also warms the cache, so the `/voice-line.wav` request that follows is
+    served from memory.
+    """
+    said = await get_greeting(text)
+    return SpokenLine(text=said.text, levels=said.levels, frame_ms=FRAME_MS)
+
+
+@app.get("/voice-line.wav")
+async def voice_line(text: str) -> Response:
+    """The audio for one line.
+
+    A plain file rather than base64 in a JSON body, so the browser and the OS
+    can cache it. The text fully determines the audio, so it is safe to mark
+    immutable and never ask for it again.
+    """
+    said = await get_greeting(text)
+    return Response(
+        content=said.wav,
+        media_type="audio/wav",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.get("/welcome-lines", response_model=WelcomeLinesResponse)
+async def welcome_lines() -> WelcomeLinesResponse:
+    """Every line the orb can say on the welcome screen, audio included.
+
+    The app fetches this once in the background and keeps it, so a tap on the
+    orb gets an answer immediately. Cold it takes a few seconds while the lines
+    are synthesised in parallel; warm it is instant.
+    """
+    groups = await get_welcome_lines()
+    as_lines = {
+        name: [
+            SpokenLine(text=line.text, levels=line.levels, frame_ms=FRAME_MS)
+            for line in lines
+        ]
+        for name, lines in groups.items()
+    }
+    return WelcomeLinesResponse(**as_lines)
 
 
 @app.get("/sessions")
