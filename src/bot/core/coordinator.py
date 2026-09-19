@@ -1,28 +1,49 @@
-"""Builds the multi-agent graph and routes turns through it.
+"""Builds the multi-agent graph and routes each turn through it.
 
-Shape (same idea as the ajimganj concierge, trimmed to three specialists):
+Shape:
 
-    START
-      └─► orchestrator ──(picks a specialist)──► trains | flights | stays
-                                                      │
-                                                 (answers the user, or
-                                                  hands control back)
-                                                      ▼
-                                                    END (waits for next turn)
+    START ──► orchestrator ──(calls transfer_to_X)──► trains | flights | stays
+                    │                                         │
+              (no handoff: it                            (answers, then)
+               answered itself)                                │
+                    └───────────────► END ◄───────────────────┘
 
 How routing works, and why it's cheap: the orchestrator doesn't "decide" in
-prose. It calls a `transfer_to_*` tool, and we read which tool it called to
-pick the next node. No second LLM call to route. `active_agent` is saved in
-state so the *next* user turn skips the orchestrator and resumes with the same
-specialist — the checkpointer (MemorySaver) makes that survive across turns,
-keyed by the LiveKit room.
+prose. It calls a `transfer_to_*` tool and we read *which* tool it called. No
+second LLM call, no parsing English.
 
-This module has no Pipecat in it on purpose: it's a pure LangGraph you could
-unit-test from a script. The voice layer (processors/) drives it.
+Three decisions worth knowing about:
+
+1. **Every turn re-enters at the orchestrator.** Travellers change subject
+   ("...and somewhere to stay") far more often than they stay in one lane, and
+   the orchestrator sees the whole history so it routes follow-ups correctly.
+   One cheap Haiku call per turn buys that. `active_agent` is therefore
+   this-turn routing, not sticky state.
+
+2. **The orchestrator's handoff message never enters the transcript.** A
+   handoff is an AIMessage whose only content is a tool call nobody answers.
+   Keeping it would (a) break the specialist — `create_react_agent` rejects a
+   history with an unanswered tool call — and (b) put routing plumbing in the
+   transcript the app displays. So a routing turn contributes no message; only
+   real speech does.
+
+3. **Every node is async.** LangGraph runs a synchronous node on a thread from
+   the default executor. Inside a realtime voice pipeline that pool is already
+   contended — 50 audio frames a second, Silero VAD and end-of-turn inference
+   all want it — and an LLM node measured over a minute of queueing before it
+   made its first API call, while the caller sat listening to silence. Async
+   nodes do their waiting as ordinary non-blocking I/O and start immediately.
+   Keep it that way: one `.invoke()` in here reintroduces the stall.
+
+This module contains no Pipecat: it's a pure LangGraph you can drive from a
+terminal (`make brain`). The voice layer in processors/ drives it in a call.
 """
 
 import logging
+from datetime import date
 
+from langchain_core.messages import SystemMessage
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
@@ -34,6 +55,7 @@ from src.bot.agents.specialists import (
 from src.bot.core.llm import get_llm
 from src.bot.core.state import TripState
 from src.bot.prompts.orchestrator_prompt import ORCHESTRATOR_PROMPT
+from src.bot.prompts.global_constraints import today_line
 
 logger = logging.getLogger(__name__)
 
@@ -45,46 +67,65 @@ SPECIALISTS = {
 }
 
 
-def build_graph():
-    """Compile the graph once per session. Returns something with `.invoke` /
-    `.astream` that the voice processor calls each user turn."""
-    specialists = {name: factory() for name, factory in SPECIALISTS.items()}
-
-    # The orchestrator is the model bound to one handoff tool per specialist.
-    # The tools do nothing but exist to be *called* — we inspect the call.
-    from langchain_core.tools import tool
-
-    handoffs = []
+def _make_handoff_tools() -> list:
+    """One no-op tool per specialist. They are never executed — the orchestrator
+    *calling* one is the routing signal, and we read the call directly."""
+    tools = []
     for name in SPECIALISTS:
+
         @tool(f"transfer_to_{name}")
         def _handoff(reason: str = "", _name: str = name) -> str:
             """Hand the conversation to a specialist."""
             return _name
 
-        handoffs.append(_handoff)
+        tools.append(_handoff)
+    return tools
 
-    orchestrator = get_llm().bind_tools(handoffs)
 
-    def orchestrator_node(state: TripState) -> dict:
-        from langchain_core.messages import SystemMessage
+def build_graph():
+    """Compile the graph. Returns something with `.invoke` / `.astream_events`
+    that the voice processor calls once per user turn.
 
-        reply = orchestrator.invoke(
-            [SystemMessage(content=ORCHESTRATOR_PROMPT), *state["messages"]]
-        )
-        # Which specialist did it choose? Read the tool call, don't parse prose.
-        target = "orchestrator"
+    Called once per session, which also means the date injected below is fresh
+    for every call.
+    """
+    specialists = {name: factory() for name, factory in SPECIALISTS.items()}
+    orchestrator = get_llm().bind_tools(_make_handoff_tools())
+
+    # Today's date, resolved when the graph is built. Without it the model has
+    # no way to turn "next Friday" or "the 2nd of October" into the YYYY-MM-DD
+    # the search tools require, and it will quietly guess a year.
+    system = SystemMessage(content=f"{today_line()}\n{ORCHESTRATOR_PROMPT}")
+
+    async def orchestrator_node(state: TripState) -> dict:
+        reply = await orchestrator.ainvoke([system, *state["messages"]])
+
+        target = None
         for call in getattr(reply, "tool_calls", []) or []:
             if call["name"].startswith("transfer_to_"):
                 target = call["name"].removeprefix("transfer_to_")
-        return {"messages": [reply], "active_agent": target}
+                break
+
+        if target in SPECIALISTS:
+            logger.info("routing to %s", target)
+            # Routing only — see note 2 in the module docstring. No message.
+            return {"active_agent": target}
+
+        # No handoff: the orchestrator answered the traveller itself (a greeting,
+        # or a question it needed to ask). That IS speech, so it goes in.
+        return {"messages": [reply], "active_agent": "orchestrator"}
 
     def make_specialist_node(name: str):
         agent = specialists[name]
 
-        def node(state: TripState) -> dict:
-            result = agent.invoke({"messages": state["messages"]})
-            # Specialist answered; hand control back to the desk for next turn.
-            return {"messages": result["messages"], "active_agent": "orchestrator"}
+        async def node(state: TripState) -> dict:
+            history = state["messages"]
+            result = await agent.ainvoke({"messages": history})
+            # A react agent returns the whole conversation back. Only the tail is
+            # new; returning the head as well would re-send messages the reducer
+            # already holds.
+            produced = result["messages"][len(history):]
+            return {"messages": produced, "active_agent": "orchestrator"}
 
         return node
 
@@ -93,17 +134,9 @@ def build_graph():
     for name in SPECIALISTS:
         graph.add_node(name, make_specialist_node(name))
 
-    # Entry: resume with whoever held the conversation last turn; first turn
-    # (active_agent unset) starts at the orchestrator.
-    def entry(state: TripState) -> str:
-        current = state.get("active_agent", "orchestrator")
-        return current if current in SPECIALISTS else "orchestrator"
+    graph.add_edge(START, "orchestrator")
 
-    graph.add_conditional_edges(START, entry,
-                                {**{n: n for n in SPECIALISTS}, "orchestrator": "orchestrator"})
-
-    # After the orchestrator, go to the chosen specialist (or end if it just
-    # talked without handing off).
+    # After the orchestrator: to the chosen specialist, or end if it just spoke.
     graph.add_conditional_edges(
         "orchestrator",
         lambda s: s["active_agent"] if s["active_agent"] in SPECIALISTS else END,
@@ -112,6 +145,7 @@ def build_graph():
     for name in SPECIALISTS:
         graph.add_edge(name, END)
 
-    # MemorySaver keeps each room's conversation in memory across turns. Swap for
-    # a Redis/Postgres checkpointer to survive a restart (see AGENT_GUIDE.md).
+    # MemorySaver keeps each room's conversation in memory across turns, keyed by
+    # thread_id (the LiveKit room name — see LangGraphProcessor). Swap for a
+    # Redis/Postgres checkpointer to survive a restart. See AGENT_GUIDE.md.
     return graph.compile(checkpointer=MemorySaver())

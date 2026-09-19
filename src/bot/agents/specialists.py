@@ -17,14 +17,20 @@ from langgraph.prebuilt import create_react_agent
 from src.bot.core.llm import get_llm, get_llm_heavy
 from src.bot.core.tools import search_flights, search_stays, search_trains
 from src.bot.prompts.flights_prompt import FLIGHTS_PROMPT
-from src.bot.prompts.global_constraints import GLOBAL_CONSTRAINTS
+from src.bot.prompts.global_constraints import GLOBAL_CONSTRAINTS, today_line
 from src.bot.prompts.stays_prompt import STAYS_PROMPT
 from src.bot.prompts.trains_prompt import TRAINS_PROMPT
 
 
 def _prompt(specific: str) -> str:
-    # Global spoken-output rules first, then the specialist's own brief.
-    return f"{GLOBAL_CONSTRAINTS}\n\n{specific}"
+    """Today's date, the spoken-output rules, then the specialist's own brief.
+
+    The date has to be in here: `search_trains(depart_date="2026-10-02")` is
+    unanswerable from "next Friday" without it. It is resolved when the factory
+    runs — i.e. once per session, in build_graph — so a process left running
+    overnight doesn't keep yesterday's date.
+    """
+    return f"{today_line()}\n{GLOBAL_CONSTRAINTS}\n\n{specific}"
 
 
 def create_trains_agent():
