@@ -2,7 +2,6 @@
 
 The voice brain. Pipecat pipeline (STT → LangGraph → ElevenLabs TTS) with a
 multi-agent Claude graph (orchestrator + trains/flights/stays specialists).
-Structured after the ajimganj concierge.
 
 - New here? Read **AGENT_GUIDE.md** — the mental model, how a turn flows, how to
   add a specialist, and how to test the brain with no microphone.
