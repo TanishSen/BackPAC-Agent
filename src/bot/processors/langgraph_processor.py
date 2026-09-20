@@ -55,15 +55,30 @@ class ToolResultFrame(DataFrame):
 
 
 class LangGraphProcessor(FrameProcessor):
-    def __init__(self, graph, *, room_name: str, word_interceptor=None):
+    def __init__(
+        self, graph, *, room_name: str, word_interceptor=None, transcript=None
+    ):
         super().__init__()
         self._graph = graph
         self._room_name = room_name
         self._word_interceptor = word_interceptor
+        # Writes the conversation to the backend as it happens, so it shows up
+        # in history. Optional: None means this call simply is not recorded,
+        # which is what the terminal harnesses and the tests want.
+        self._transcript = transcript
         # The graph's checkpointer keys memory by thread_id. Using the room name
         # (stable across reconnects) means a dropped-and-rejoined call resumes
         # the same conversation instead of starting over.
         self._thread_id = room_name
+
+    def set_thread_id(self, thread_id: str) -> None:
+        """Think in a specific LangGraph thread.
+
+        The backend sends one when a conversation is being resumed, so the
+        graph loads that conversation's checkpoint instead of starting blank.
+        Defaults to the room name, which is the same value for a new call.
+        """
+        self._thread_id = thread_id
 
     def set_participant_id(self, participant_id: str) -> None:
         """Called from the transport's on_first_participant_joined. We prefer the
@@ -160,6 +175,8 @@ class LangGraphProcessor(FrameProcessor):
     async def _run_turn(self, text: str) -> None:
         """One user turn → a streamed spoken reply."""
         logger.info("[%s] user: %s", self._room_name, text)
+        if self._transcript:
+            self._transcript.user_said(text)
         await self.push_frame(LLMFullResponseStartFrame())
 
         input_state = {
@@ -170,6 +187,10 @@ class LangGraphProcessor(FrameProcessor):
         config = {"configurable": {"thread_id": self._thread_id}}
 
         spoke = False
+        # The reply is streamed token by token to be spoken as it arrives, but
+        # history wants the finished sentence. Collect the pieces and write one
+        # message at the end rather than one row per token.
+        said: list[str] = []
         try:
             # astream_events(v2) gives fine-grained events: per-token model
             # streams, and tool start/end — everything we need to be responsive.
@@ -191,19 +212,26 @@ class LangGraphProcessor(FrameProcessor):
                     token = self._token_text(chunk)
                     if token:
                         spoke = True
+                        said.append(token)
                         await self.push_frame(TextFrame(token))
                 elif kind == "on_tool_end":
                     name = event.get("name", "")
                     # Routing handoffs are internal; only real searches are cards.
                     if not name.startswith("transfer_to_"):
+                        payload = self._card_payload(event["data"].get("output"))
                         await self.push_frame(
-                            ToolResultFrame(
-                                card_type=name,
-                                result=self._card_payload(event["data"].get("output")),
-                            )
+                            ToolResultFrame(card_type=name, result=payload)
                         )
+                        if self._transcript:
+                            self._transcript.showed_card(
+                                result_type=_card_kind(name),
+                                payload={"tool": name, "result": payload},
+                            )
         except Exception:  # noqa: BLE001 — never let one bad turn kill the call
             logger.exception("[%s] turn failed", self._room_name)
+
+        if self._transcript and said:
+            self._transcript.agent_said("".join(said).strip())
 
         if not spoke:
             # Silence after someone speaks reads as "it's broken". Say something
@@ -216,3 +244,18 @@ class LangGraphProcessor(FrameProcessor):
         # Always close the response, even on error, so the app commits the
         # transcript line and TTS flushes.
         await self.push_frame(LLMFullResponseEndFrame())
+
+
+def _card_kind(tool_name: str) -> str:
+    """Which kind of card a search tool produced.
+
+    The backend stores one of three types; the tool names are the agent's own
+    vocabulary. Anything unrecognised is filed as a stay rather than dropped —
+    a card in the wrong bucket is recoverable, a card that was never saved is
+    not.
+    """
+    if "train" in tool_name:
+        return "train"
+    if "flight" in tool_name:
+        return "flight"
+    return "stay"

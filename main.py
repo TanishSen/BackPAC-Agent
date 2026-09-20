@@ -52,6 +52,8 @@ from src.bot.infrastructure.events import (
 from src.bot.infrastructure.transport import create_transport
 from src.bot.processors.langgraph_processor import LangGraphProcessor
 from src.bot.processors.pipeline import create_pipeline, create_services
+from src.bot.clients.transcript import TranscriptClient
+from src.bot.core.checkpoints import make_checkpointer
 from src.bot.voice.greeting import FRAME_MS, get_greeting, get_welcome_lines
 
 logging.basicConfig(
@@ -77,21 +79,33 @@ app.add_middleware(
 running: dict[str, asyncio.Task] = {}
 
 
-async def run_bot(room_name: str, session_id: str) -> None:
+async def run_bot(
+    room_name: str, session_id: str, *, thread_id: str | None = None
+) -> None:
     """Join the room and run the pipeline until the session ends or is cancelled."""
-    # One graph per call. It carries its own checkpointer (memory), keyed by the
-    # room name inside the processor, so the conversation survives a reconnect.
-    graph = build_graph()
+
+    # Writes each turn to the backend so the conversation shows up in history.
+    # Fire-and-forget by construction: see the class docstring. If the backend
+    # is unreachable, the call carries on unrecorded rather than stalling.
+    transcript = TranscriptClient(room_name=room_name)
 
     transport, aic_filter = create_transport(room_name)
 
-    async with aiohttp.ClientSession() as http:
+    # The checkpointer holds the conversation between turns, keyed by
+    # thread_id. Postgres-backed when one is configured, so resuming a chat
+    # after a restart picks up the actual conversation rather than a blank one.
+    async with make_checkpointer() as checkpointer, aiohttp.ClientSession() as http:
+        graph = build_graph(checkpointer)
         stt, tts = create_services(
             voice_id=os.getenv("ELEVENLABS_VOICE_ID"),
             aiohttp_session=http,
         )
 
-        brain = LangGraphProcessor(graph, room_name=room_name)
+        brain = LangGraphProcessor(
+            graph, room_name=room_name, transcript=transcript
+        )
+        if thread_id:
+            brain.set_thread_id(thread_id)
         pipeline, aggregators, word_interceptor = create_pipeline(
             transport, aic_filter, stt, tts, brain, room_name
         )
@@ -119,12 +133,19 @@ async def run_bot(room_name: str, session_id: str) -> None:
                 await asyncio.wait_for(worker.cancel(), timeout=5.0)
             except (TimeoutError, Exception) as exc:  # noqa: BLE001
                 logger.warning("[%s] cleanup issue: %s", session_id, exc)
+            # Wrap up before the loop goes away: name the conversation and
+            # let the last thing said reach history.
+            await transcript.finish()
             raise
+        finally:
+            await transcript.finish()
 
 
-async def _session(room_name: str, session_id: str) -> None:
+async def _session(
+    room_name: str, session_id: str, thread_id: str | None = None
+) -> None:
     try:
-        await run_bot(room_name, session_id)
+        await run_bot(room_name, session_id, thread_id=thread_id)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 — log, never leak a dead task
@@ -144,8 +165,15 @@ async def start(request: StartRequest) -> StartResponse:
     session_id = request.session_id or str(uuid.uuid4())
     if session_id in running and not running[session_id].done():
         raise HTTPException(409, f"session {session_id} already running")
-    running[session_id] = asyncio.create_task(_session(request.room_name, session_id))
-    logger.info("started session %s for room %s", session_id, request.room_name)
+    running[session_id] = asyncio.create_task(
+        _session(request.room_name, session_id, request.thread_id)
+    )
+    logger.info(
+        "%s session %s for room %s",
+        "resumed" if request.is_resuming else "started",
+        session_id,
+        request.room_name,
+    )
     return StartResponse(session_id=session_id)
 
 

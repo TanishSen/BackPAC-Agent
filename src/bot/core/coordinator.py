@@ -82,12 +82,19 @@ def _make_handoff_tools() -> list:
     return tools
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     """Compile the graph. Returns something with `.invoke` / `.astream_events`
     that the voice processor calls once per user turn.
 
     Called once per session, which also means the date injected below is fresh
     for every call.
+
+    `checkpointer` is where the conversation's memory lives, keyed by
+    thread_id. Pass an `AsyncPostgresSaver` (see `make_checkpointer`) and a
+    conversation survives a restart, a redeploy and a second container, which
+    is what makes "resume this chat" mean anything. Omit it and you get
+    `MemorySaver`: fine for a terminal harness or a test, useless in
+    production, because the state lives in one process's RAM and dies with it.
     """
     specialists = {name: factory() for name, factory in SPECIALISTS.items()}
     orchestrator = get_llm().bind_tools(_make_handoff_tools())
@@ -145,7 +152,6 @@ def build_graph():
     for name in SPECIALISTS:
         graph.add_edge(name, END)
 
-    # MemorySaver keeps each room's conversation in memory across turns, keyed by
-    # thread_id (the LiveKit room name — see LangGraphProcessor). Swap for a
-    # Redis/Postgres checkpointer to survive a restart. See AGENT_GUIDE.md.
-    return graph.compile(checkpointer=MemorySaver())
+    # The checkpointer keeps each room's conversation across turns, keyed by
+    # thread_id (the LiveKit room name — see LangGraphProcessor).
+    return graph.compile(checkpointer=checkpointer or MemorySaver())

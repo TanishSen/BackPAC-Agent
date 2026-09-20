@@ -11,6 +11,14 @@ class StartRequest(BaseModel):
     room_name: str = Field(alias="roomName")
     session_id: str = Field(alias="sessionId")
     agent_id: str = Field(alias="agentId")
+    #: The LangGraph thread to think in. Equal to the room name today, but its
+    #: own field so the two can diverge later without a wire change on both
+    #: sides at once. Defaults to the room name when the backend omits it.
+    thread_id: str | None = Field(default=None, alias="threadId")
+    #: True when this call continues an earlier conversation. The graph loads
+    #: whatever state the thread has either way; this only decides whether to
+    #: open with a greeting or pick up mid-sentence.
+    is_resuming: bool = Field(default=False, alias="isResuming")
 
 
 class StartResponse(BaseModel):

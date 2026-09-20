@@ -15,3 +15,10 @@ httpx==0.28.1
 langchain-core>=0.3
 langchain-anthropic>=0.3
 langgraph>=0.2.40
+
+# Conversation state in Postgres rather than this process's memory, so a chat
+# can be resumed after a restart or from a second container.
+# See src/bot/core/checkpoints.py.
+langgraph-checkpoint-postgres==3.1.2
+# psycopg's driver, prebuilt — the pure-python path needs libpq on the host.
+psycopg[binary]==3.3.6
