@@ -33,7 +33,13 @@ EXPOSE 8080
 # "/" reports the process and how many calls it is carrying. It deliberately
 # does not probe LiveKit or Claude — a health check that fans out is a health
 # check that flaps and restarts a healthy process mid-call.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+# A generous start period and timeout on purpose: this process imports
+# Pipecat and loads the Silero VAD and end-of-turn ONNX models before it binds,
+# and once it is up a single-threaded asyncio loop is also carrying live calls.
+# Twenty seconds and a three-second timeout marked a perfectly healthy agent
+# unhealthy on a cold start, which in an orchestrator means being restarted
+# mid-call.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2).status==200 else 1)"
 
 # One worker on purpose. Sessions live in this process's memory (`running` in

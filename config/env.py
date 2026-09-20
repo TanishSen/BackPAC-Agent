@@ -38,9 +38,13 @@ def load_env() -> None:
     if ENV_FILE.exists():
         load_dotenv(ENV_FILE, override=True)
     else:
-        logger.warning(
-            "no .env at %s — relying on the ambient environment. "
-            "Copy .env.example to .env and fill it in.",
+        # Normal in a container, where .dockerignore keeps .env out of the
+        # image and compose supplies the values instead. Worth saying either
+        # way, but not as a warning that looks like something is broken —
+        # `require()` below is what actually catches a missing key.
+        logger.info(
+            "no .env at %s; using the ambient environment "
+            "(expected in Docker, where compose supplies the values)",
             ENV_FILE,
         )
     _loaded = True
