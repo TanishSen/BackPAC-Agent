@@ -135,7 +135,11 @@ by_room: dict[str, str] = {}
 
 
 async def run_bot(
-    room_name: str, session_id: str, *, thread_id: str | None = None
+    room_name: str,
+    session_id: str,
+    *,
+    thread_id: str | None = None,
+    premium: bool = False,
 ) -> None:
     """Join the room and run the pipeline until the session ends or is cancelled."""
 
@@ -150,7 +154,7 @@ async def run_bot(
     # thread_id. Postgres-backed when one is configured, so resuming a chat
     # after a restart picks up the actual conversation rather than a blank one.
     async with make_checkpointer() as checkpointer, aiohttp.ClientSession() as http:
-        graph = build_graph(checkpointer)
+        graph = build_graph(checkpointer, premium=premium)
         stt, tts = create_services(
             voice_id=os.getenv("ELEVENLABS_VOICE_ID"),
             aiohttp_session=http,
@@ -218,10 +222,13 @@ async def run_bot(
 
 
 async def _session(
-    room_name: str, session_id: str, thread_id: str | None = None
+    room_name: str,
+    session_id: str,
+    thread_id: str | None = None,
+    premium: bool = False,
 ) -> None:
     try:
-        await run_bot(room_name, session_id, thread_id=thread_id)
+        await run_bot(room_name, session_id, thread_id=thread_id, premium=premium)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 — log, never leak a dead task
@@ -276,7 +283,7 @@ async def start(request: StartRequest) -> StartResponse:
 
     by_room[request.room_name] = session_id
     running[session_id] = asyncio.create_task(
-        _session(request.room_name, session_id, request.thread_id)
+        _session(request.room_name, session_id, request.thread_id, request.is_premium)
     )
     logger.info(
         "%s session %s for room %s",

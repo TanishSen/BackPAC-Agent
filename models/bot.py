@@ -19,6 +19,9 @@ class StartRequest(BaseModel):
     #: whatever state the thread has either way; this only decides whether to
     #: open with a greeting or pick up mid-sentence.
     is_resuming: bool = Field(default=False, alias="isResuming")
+    #: A backPAC Premium member — decided by the backend from RevenueCat, never
+    #: by the app. Turns on the Premium planner (see global_constraints).
+    is_premium: bool = Field(default=False, alias="isPremium")
 
 
 class StartResponse(BaseModel):

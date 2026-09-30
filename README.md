@@ -9,3 +9,9 @@ multi-agent Claude graph (orchestrator + trains/flights/stays specialists).
   → `python main.py` (:8080).
 
 BackPAC-BE calls this service's `POST /start` to put a bot into a room.
+
+---
+
+Part of **backPAC**, a voice travel planner — start at
+[BackPAC-Fe](https://github.com/TanishSen/BackPAC-Fe) for the overview and how the
+three repositories fit together. MIT licensed; see [LICENSE](LICENSE).

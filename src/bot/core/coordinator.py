@@ -82,7 +82,7 @@ def _make_handoff_tools() -> list:
     return tools
 
 
-def build_graph(checkpointer=None):
+def build_graph(checkpointer=None, *, premium: bool = False):
     """Compile the graph. Returns something with `.invoke` / `.astream_events`
     that the voice processor calls once per user turn.
 
@@ -96,7 +96,11 @@ def build_graph(checkpointer=None):
     `MemorySaver`: fine for a terminal harness or a test, useless in
     production, because the state lives in one process's RAM and dies with it.
     """
-    specialists = {name: factory() for name, factory in SPECIALISTS.items()}
+    # `premium` switches on the Premium planner's insider tips in every
+    # specialist — the orchestrator only routes, so it needs no change.
+    specialists = {
+        name: factory(premium=premium) for name, factory in SPECIALISTS.items()
+    }
     orchestrator = get_llm().bind_tools(_make_handoff_tools())
 
     # Today's date, resolved when the graph is built. Without it the model has
