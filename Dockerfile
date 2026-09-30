@@ -1,5 +1,7 @@
 # BackPAC agent — the Pipecat voice pipeline and the Claude trip brain.
-FROM python:3.12-slim
+# bookworm, pinned: plain `slim` moved to trixie, where libasound2 and libssl3
+# are only virtual packages and this apt line stops resolving.
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -40,10 +42,14 @@ EXPOSE 8080
 # unhealthy on a cold start, which in an orchestrator means being restarted
 # mid-call.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2).status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/' % os.environ.get('PORT','8080'), timeout=2).status==200 else 1)"
 
 # One worker on purpose. Sessions live in this process's memory (`running` in
 # main.py), so a second worker would take /stop calls for calls it has never
 # heard of. Scale by running more containers, not more workers — each call is
 # independent, and the LiveKit room is what ties a caller to their agent.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+#
+# $PORT because hosting platforms assign one. The graceful-shutdown window lets
+# live calls name themselves and flush history on a deploy (see main.py's
+# lifespan); give the container at least this long before SIGKILL.
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --timeout-graceful-shutdown 25"]

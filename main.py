@@ -1,10 +1,15 @@
 """BackPAC agent runtime — the process that puts a voice bot into a LiveKit room.
 
 HTTP surface (called by BackPAC-BE, mirrors the ajimganj concierge):
-  GET  /             health
+  GET  /             health — the only route without the service token
   POST /start        join a room and start the voice loop
   POST /stop         end a session
   GET  /sessions     list running sessions
+  GET  /greeting, /welcome-lines, /voice-line.wav   the welcome screen's lines
+
+Every route but `/` needs `X-Service-Token: $BACKEND_SERVICE_TOKEN`. BackPAC-BE
+sends it; nothing else should be calling this process. `/start` puts a bot on
+three paid APIs, so an agent reachable without that check is an open tap.
 
 Run:  python main.py         (or  uvicorn main:app --port 8080)
 
@@ -21,13 +26,14 @@ own.
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.workers.runner import WorkerRunner
 
@@ -53,8 +59,13 @@ from src.bot.infrastructure.transport import create_transport
 from src.bot.processors.langgraph_processor import LangGraphProcessor
 from src.bot.processors.pipeline import create_pipeline, create_services
 from src.bot.clients.transcript import TranscriptClient
-from src.bot.core.checkpoints import make_checkpointer
-from src.bot.voice.greeting import FRAME_MS, get_greeting, get_welcome_lines
+from src.bot.core.checkpoints import close_shared_checkpointer, make_checkpointer
+from src.bot.voice.greeting import (
+    FRAME_MS,
+    UnknownLine,
+    get_greeting,
+    get_welcome_lines,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -65,18 +76,62 @@ logger = logging.getLogger("backpac-agent")
 
 # Die now, with a readable message, rather than accepting a /start and failing
 # three layers deep inside a provider SDK once someone is already on the call.
-require(*voice_requirements())
+#
+# The backend pair is required too: without BACKEND_URL the search tools call
+# nowhere, and without the token every search and every transcript write is
+# refused — a call that "works" but can find nothing and remembers nothing.
+require(*voice_requirements(), "BACKEND_URL", "BACKEND_SERVICE_TOKEN")
 
-app = FastAPI(title="BackPAC Agent", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+SERVICE_TOKEN = os.environ["BACKEND_SERVICE_TOKEN"]
+
+#: How many calls this process carries at once. Every call shares one event
+#: loop with the VAD and end-of-turn models, so past some number they all get
+#: worse together; refusing the next one is kinder than degrading all of them.
+#: Scale out with more containers, not a bigger number here.
+MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "20"))
+
+#: How long a bot waits in its room for the caller before giving up. The app
+#: joins within seconds of the backend's answer; a room still empty after this
+#: means the app crashed, lost its network, or was closed mid-connect, and the
+#: bot would otherwise hold a slot until the 15-minute idle timeout.
+JOIN_TIMEOUT_SECONDS = float(os.getenv("JOIN_TIMEOUT_SECONDS", "60"))
+
+
+async def require_service(
+    x_service_token: str | None = Header(default=None),
+) -> None:
+    """Refuse anyone who is not BackPAC-BE. Constant-time compare."""
+    if not x_service_token or not hmac.compare_digest(
+        x_service_token, SERVICE_TOKEN
+    ):
+        raise HTTPException(401, "Bad or missing X-Service-Token.")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    # A deploy or restart: end every call cleanly rather than letting the
+    # process die under them, so each one names its conversation and flushes
+    # its last lines to history. Bounded, because the orchestrator's kill
+    # timer is running (compose gives 30s).
+    tasks = [t for t in running.values() if not t.done()]
+    if tasks:
+        logger.info("shutting down: ending %d call(s)", len(tasks))
+        for t in tasks:
+            t.cancel()
+        await asyncio.wait(tasks, timeout=20)
+    await close_shared_checkpointer()
+
+
+# No CORS: nothing calls this from a browser. The app talks to BackPAC-BE.
+app = FastAPI(title="BackPAC Agent", version="1.0.0", lifespan=lifespan)
 
 # session_id -> the asyncio Task running that bot.
 running: dict[str, asyncio.Task] = {}
+# room -> the session_id of the bot in it. One bot per room: a second one would
+# join under the same identity, get the first kicked by LiveKit, and leave its
+# pipeline running against nothing.
+by_room: dict[str, str] = {}
 
 
 async def run_bot(
@@ -87,7 +142,7 @@ async def run_bot(
     # Writes each turn to the backend so the conversation shows up in history.
     # Fire-and-forget by construction: see the class docstring. If the backend
     # is unreachable, the call carries on unrecorded rather than stalling.
-    transcript = TranscriptClient(room_name=room_name)
+    transcript = TranscriptClient(room_name=room_name, run_id=session_id)
 
     transport, aic_filter = create_transport(room_name)
 
@@ -118,13 +173,31 @@ async def run_bot(
             params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
             idle_timeout_secs=900,
         )
-        setup_event_handlers(transport, worker, brain, room_name=room_name)
+        joined = asyncio.Event()
+        setup_event_handlers(
+            transport, worker, brain, room_name=room_name, joined=joined
+        )
         setup_user_aggregator_handlers(aggregators.user())
 
-        runner = WorkerRunner()
+        async def _nobody_came() -> None:
+            try:
+                await asyncio.wait_for(joined.wait(), JOIN_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.info(
+                    "[%s] nobody joined room %s in %.0fs — ending",
+                    session_id,
+                    room_name,
+                    JOIN_TIMEOUT_SECONDS,
+                )
+                await worker.cancel()
+
+        # handle_sigint=False: the runner is per call, and each one taking over
+        # Ctrl-C meant only the newest call stopped and the server never did.
+        runner = WorkerRunner(handle_sigint=False)
         await runner.add_workers(worker)
 
         logger.info("[%s] bot running in room %s", session_id, room_name)
+        watchdog = asyncio.create_task(_nobody_came())
         try:
             await runner.run()
         except asyncio.CancelledError:
@@ -138,7 +211,10 @@ async def run_bot(
             await transcript.finish()
             raise
         finally:
+            watchdog.cancel()
             await transcript.finish()
+            transcript.ended()
+            await transcript.drain()
 
 
 async def _session(
@@ -152,19 +228,53 @@ async def _session(
         logger.exception("[%s] session crashed", session_id)
     finally:
         running.pop(session_id, None)
+        if by_room.get(room_name) == session_id:
+            del by_room[room_name]
         logger.info("[%s] session cleaned up", session_id)
+
+
+def _active() -> int:
+    return sum(1 for t in running.values() if not t.done())
 
 
 @app.get("/")
 async def health() -> dict:
-    return {"status": "running", "service": "backpac-agent", "sessions": len(running)}
+    return {
+        "status": "running",
+        "service": "backpac-agent",
+        "sessions": _active(),
+        "max_sessions": MAX_SESSIONS,
+    }
 
 
-@app.post("/start", response_model=StartResponse)
+@app.post(
+    "/start", response_model=StartResponse, dependencies=[Depends(require_service)]
+)
 async def start(request: StartRequest) -> StartResponse:
     session_id = request.session_id or str(uuid.uuid4())
     if session_id in running and not running[session_id].done():
         raise HTTPException(409, f"session {session_id} already running")
+
+    # A bot already in this room — a resume, or the app retrying a start —
+    # is replaced, not joined by a twin. Cancelled and awaited (briefly) first
+    # so the old one has left before the new one arrives under the same name.
+    previous = by_room.get(request.room_name)
+    old = running.get(previous) if previous else None
+    if old is not None and not old.done():
+        logger.info(
+            "[%s] replacing bot %s already in room %s",
+            session_id,
+            previous,
+            request.room_name,
+        )
+        old.cancel()
+        await asyncio.wait([old], timeout=8)
+
+    if _active() >= MAX_SESSIONS:
+        logger.warning("at capacity (%d calls) — refusing a new one", MAX_SESSIONS)
+        raise HTTPException(503, "The agent is at capacity. Try again shortly.")
+
+    by_room[request.room_name] = session_id
     running[session_id] = asyncio.create_task(
         _session(request.room_name, session_id, request.thread_id)
     )
@@ -177,7 +287,7 @@ async def start(request: StartRequest) -> StartResponse:
     return StartResponse(session_id=session_id)
 
 
-@app.post("/stop")
+@app.post("/stop", dependencies=[Depends(require_service)])
 async def stop(request: StopRequest) -> dict:
     task = running.get(request.session_id)
     if task is None:
@@ -186,7 +296,9 @@ async def stop(request: StopRequest) -> dict:
     return {"status": "stopping", "session_id": request.session_id}
 
 
-@app.get("/greeting", response_model=SpokenLine)
+@app.get(
+    "/greeting", response_model=SpokenLine, dependencies=[Depends(require_service)]
+)
 async def greeting(text: str | None = None) -> SpokenLine:
     """The spoken hello for the welcome screen, with a level track for the orb.
 
@@ -194,11 +306,14 @@ async def greeting(text: str | None = None) -> SpokenLine:
     also warms the cache, so the `/voice-line.wav` request that follows is
     served from memory.
     """
-    said = await get_greeting(text)
+    try:
+        said = await get_greeting(text)
+    except UnknownLine:
+        raise HTTPException(404, "No such line.") from None
     return SpokenLine(text=said.text, levels=said.levels, frame_ms=FRAME_MS)
 
 
-@app.get("/voice-line.wav")
+@app.get("/voice-line.wav", dependencies=[Depends(require_service)])
 async def voice_line(text: str) -> Response:
     """The audio for one line.
 
@@ -206,7 +321,12 @@ async def voice_line(text: str) -> Response:
     can cache it. The text fully determines the audio, so it is safe to mark
     immutable and never ask for it again.
     """
-    said = await get_greeting(text)
+    try:
+        said = await get_greeting(text)
+    except UnknownLine:
+        # Only our own lines. Anything else would be free text-to-speech on
+        # our ElevenLabs key, cached in this process's memory forever.
+        raise HTTPException(404, "No such line.") from None
     return Response(
         content=said.wav,
         media_type="audio/wav",
@@ -214,7 +334,11 @@ async def voice_line(text: str) -> Response:
     )
 
 
-@app.get("/welcome-lines", response_model=WelcomeLinesResponse)
+@app.get(
+    "/welcome-lines",
+    response_model=WelcomeLinesResponse,
+    dependencies=[Depends(require_service)],
+)
 async def welcome_lines() -> WelcomeLinesResponse:
     """Every line the orb can say on the welcome screen, audio included.
 
@@ -233,7 +357,7 @@ async def welcome_lines() -> WelcomeLinesResponse:
     return WelcomeLinesResponse(**as_lines)
 
 
-@app.get("/sessions")
+@app.get("/sessions", dependencies=[Depends(require_service)])
 async def sessions() -> dict:
     return {"running": [sid for sid, t in running.items() if not t.done()]}
 

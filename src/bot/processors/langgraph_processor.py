@@ -25,6 +25,7 @@ Ported from the ajimganj concierge's UnifiedLanggraphProcessor and adapted to
 the BackPAC trip graph.
 """
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -217,16 +218,39 @@ class LangGraphProcessor(FrameProcessor):
                 elif kind == "on_tool_end":
                     name = event.get("name", "")
                     # Routing handoffs are internal; only real searches are cards.
-                    if not name.startswith("transfer_to_"):
-                        payload = self._card_payload(event["data"].get("output"))
+                    payload = (
+                        None
+                        if name.startswith("transfer_to_")
+                        else self._card_payload(event["data"].get("output"))
+                    )
+                    # A failed search is something to say, not a card to show
+                    # or keep: the model reads the error and tells the caller.
+                    if payload is not None and not _is_error(payload):
                         await self.push_frame(
                             ToolResultFrame(card_type=name, result=payload)
                         )
                         if self._transcript:
                             self._transcript.showed_card(
                                 result_type=_card_kind(name),
-                                payload={"tool": name, "result": payload},
+                                payload={
+                                    "tool": name,
+                                    # What was searched for: the profile's
+                                    # "places" count reads the destination
+                                    # from here.
+                                    "query": _query_of(event["data"].get("input")),
+                                    "result": payload,
+                                },
                             )
+        except asyncio.CancelledError:
+            # The caller talked over the agent and pipecat cancelled the turn.
+            # Keep what was actually said in history, and close the line on the
+            # app so the next reply starts a new bubble instead of running on
+            # from this one. Then let the cancellation through.
+            if self._transcript and said:
+                self._transcript.agent_said("".join(said).strip())
+            if self._word_interceptor and spoke:
+                await self._word_interceptor.close_agent_turn()
+            raise
         except Exception:  # noqa: BLE001 — never let one bad turn kill the call
             logger.exception("[%s] turn failed", self._room_name)
 
@@ -244,6 +268,25 @@ class LangGraphProcessor(FrameProcessor):
         # Always close the response, even on error, so the app commits the
         # transcript line and TTS flushes.
         await self.push_frame(LLMFullResponseEndFrame())
+
+
+def _query_of(raw: Any) -> dict:
+    """The tool's arguments, as plain JSON — or {} if they are not a dict."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: v for k, v in raw.items() if isinstance(v, (str, int, float, bool))
+    }
+
+
+def _is_error(payload: Any) -> bool:
+    """Whether a tool result is the error row `tools._post` returns."""
+    return (
+        isinstance(payload, list)
+        and len(payload) == 1
+        and isinstance(payload[0], dict)
+        and "error" in payload[0]
+    )
 
 
 def _card_kind(tool_name: str) -> str:

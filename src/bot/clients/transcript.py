@@ -36,11 +36,15 @@ class TranscriptClient:
         self,
         *,
         room_name: str,
+        run_id: str | None = None,
         base_url: str | None = None,
         service_token: str | None = None,
         timeout: float = 5.0,
     ):
         self._room = room_name
+        # Which bot this is. Sent with "the call ended", so the backend can
+        # ignore the report from a bot that was replaced by a newer one.
+        self._run_id = run_id
         self._base = (base_url or os.getenv("BACKEND_URL", "")).rstrip("/")
         self._token = service_token or os.getenv("BACKEND_SERVICE_TOKEN", "")
         self._timeout = timeout
@@ -93,6 +97,11 @@ class TranscriptClient:
                 "payload": payload,
             },
         )
+
+    def ended(self) -> None:
+        """Tell the backend the call is over, so history shows when it ended.
+        Fire and forget, like everything here; `drain` flushes it."""
+        self._post("end", {"roomName": self._room, "runId": self._run_id})
 
     def _remember(self, role: str, text: str) -> None:
         if len(self._opening) < TURNS_KEPT and text and text.strip():

@@ -27,6 +27,7 @@ SQLAlchemy driver suffix stripped.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -54,15 +55,96 @@ def _dsn() -> str | None:
     return url
 
 
+#: One pool for the whole process, shared by every call.
+#:
+#: It used to be one pool per call, opened at psycopg's default of four
+#: connections plus a fifth for setup — against the same Supabase pooler the
+#: API uses, whose free plan allows fifteen clients in total. Three concurrent
+#: calls exhausted it: new calls quietly fell back to memory (so resume broke)
+#: and the API's own queries started failing. Now the process holds at most
+#: CHECKPOINT_POOL_MAX connections however many calls it is carrying, and the
+#: schema/setup round trips happen once instead of before every call.
+_POOL_MIN = int(os.getenv("CHECKPOINT_POOL_MIN", "1"))
+_POOL_MAX = int(os.getenv("CHECKPOINT_POOL_MAX", "4"))
+
+_shared = None  # AsyncPostgresSaver, once built
+_shared_stack: AsyncExitStack | None = None
+_shared_lock = asyncio.Lock()
+
+
+async def _build_shared(dsn: str):
+    """Open the pool and run LangGraph's setup. Raises on any failure."""
+    global _shared, _shared_stack
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg import AsyncConnection
+    from psycopg_pool import AsyncConnectionPool
+
+    # The schema has to exist before any pooled connection points at it, so
+    # this one connection is opened outside the pool.
+    async with await AsyncConnection.connect(
+        dsn, autocommit=True, prepare_threshold=0
+    ) as conn:
+        await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+
+    async def _use_our_schema(conn) -> None:
+        """Runs on every connection the pool hands out.
+
+        `SET search_path` is per-connection, so doing it once on a borrowed
+        connection would leave every later one pointing at `public` — and
+        LangGraph would quietly create its tables next to ours. The pool's
+        configure hook covers all of them.
+        """
+        await conn.execute(f"SET search_path TO {SCHEMA}")
+
+    stack = AsyncExitStack()
+    try:
+        # autocommit: LangGraph's setup() issues DDL, which must not sit inside
+        # a transaction something else may roll back.
+        # prepare_threshold=0: Supabase is reached through a connection pooler,
+        # which hands the same backend connection to different clients over
+        # time — a prepared statement one made is not there for the next. Same
+        # reason the API disables asyncpg's cache.
+        # check: a connection the pooler dropped overnight is replaced when it
+        # is borrowed, instead of failing the first turn of the morning.
+        pool = await stack.enter_async_context(
+            AsyncConnectionPool(
+                conninfo=dsn,
+                min_size=_POOL_MIN,
+                max_size=_POOL_MAX,
+                open=False,
+                kwargs={"autocommit": True, "prepare_threshold": 0},
+                configure=_use_our_schema,
+                check=AsyncConnectionPool.check_connection,
+            )
+        )
+        saver = AsyncPostgresSaver(pool)
+        # Creates its tables if missing. Safe to call on every boot.
+        await saver.setup()
+    except BaseException:
+        await stack.aclose()
+        raise
+    _shared, _shared_stack = saver, stack
+    logger.info(
+        "LangGraph checkpoints in Postgres (schema %s, pool %d-%d)",
+        SCHEMA,
+        _POOL_MIN,
+        _POOL_MAX,
+    )
+
+
 @asynccontextmanager
 async def make_checkpointer():
     """Yield the best checkpointer available, as a context manager.
+
+    The Postgres one is shared by every call and outlives this block — see
+    `_shared`; it is closed once, at shutdown, by `close_shared_checkpointer`.
 
     Falls back to `MemorySaver` — with a loud warning — when there is no
     Postgres configured or it cannot be reached. A fallback rather than a crash
     because a checkpoint store being down should cost you resume, not the
     ability to take a call at all. The warning is there so this never passes
-    for normal.
+    for normal. A failure is not remembered: the next call tries again, so a
+    database blip costs the calls during it and not every call until restart.
 
     Note the shape: everything that can fail happens *before* the `yield`, and
     the `yield` itself is not inside a `try` that catches `Exception`. It was,
@@ -81,57 +163,26 @@ async def make_checkpointer():
         yield MemorySaver()
         return
 
-    async with AsyncExitStack() as stack:
-        try:
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-            from psycopg import AsyncConnection
-            from psycopg_pool import AsyncConnectionPool
+    saver = _shared
+    if saver is None:
+        async with _shared_lock:
+            if _shared is None:
+                try:
+                    await _build_shared(dsn)
+                except Exception as exc:  # noqa: BLE001 — see the docstring
+                    logger.warning(
+                        "Postgres checkpointer unavailable (%s) — falling back "
+                        "to memory. Conversations will not survive a restart.",
+                        exc,
+                    )
+            saver = _shared
 
-            # The schema has to exist before any pooled connection points at
-            # it, so this one connection is opened outside the pool.
-            async with await AsyncConnection.connect(
-                dsn, autocommit=True, prepare_threshold=0
-            ) as conn:
-                await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+    yield saver if saver is not None else MemorySaver()
 
-            async def _use_our_schema(conn) -> None:
-                """Runs on every connection the pool hands out.
 
-                `SET search_path` is per-connection, so doing it once on a
-                borrowed connection would leave every later one pointing at
-                `public` — and LangGraph would quietly create its tables next
-                to ours. The pool's configure hook covers all of them.
-                """
-                await conn.execute(f"SET search_path TO {SCHEMA}")
-
-            # autocommit: LangGraph's setup() issues DDL, which must not sit
-            # inside a transaction something else may roll back.
-            # prepare_threshold=0: Supabase is reached through a connection
-            # pooler, which hands the same backend connection to different
-            # clients over time — a prepared statement one made is not there
-            # for the next. Same reason the API disables asyncpg's cache.
-            pool = await stack.enter_async_context(
-                AsyncConnectionPool(
-                    conninfo=dsn,
-                    max_size=4,
-                    open=False,
-                    kwargs={"autocommit": True, "prepare_threshold": 0},
-                    configure=_use_our_schema,
-                )
-            )
-            saver = AsyncPostgresSaver(pool)
-            # Creates its tables if missing. Safe to call on every boot.
-            await saver.setup()
-        except Exception as exc:  # noqa: BLE001 — see the docstring
-            logger.warning(
-                "Postgres checkpointer unavailable (%s) — falling back to "
-                "memory. Conversations will not survive a restart.",
-                exc,
-            )
-            saver = None
-
-        if saver is None:
-            yield MemorySaver()
-        else:
-            logger.info("LangGraph checkpoints in Postgres (schema %s)", SCHEMA)
-            yield saver
+async def close_shared_checkpointer() -> None:
+    """Close the shared pool. Called once, when the process shuts down."""
+    global _shared, _shared_stack
+    stack, _shared, _shared_stack = _shared_stack, None, None
+    if stack is not None:
+        await stack.aclose()

@@ -24,6 +24,7 @@ import json
 from loguru import logger
 from pipecat.frames.frames import (
     Frame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     TextFrame,
     TTSSpeakFrame,
@@ -35,6 +36,10 @@ class WordInterceptor(FrameProcessor):
     def __init__(self, transport):
         super().__init__()
         self._transport = transport
+        # True between the first streamed word of a reply and its close. An
+        # interruption cuts a reply off before its LLMFullResponseEndFrame, and
+        # without a close the app appends the *next* reply to this one.
+        self._open = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -50,13 +55,24 @@ class WordInterceptor(FrameProcessor):
                 await self._publish_agent("", speech_final=True)
 
             elif isinstance(frame, TextFrame):
+                self._open = True
                 await self._publish_agent(frame.text, speech_final=False)
 
             elif isinstance(frame, LLMFullResponseEndFrame):
                 # Tell the app to commit the text it has accumulated.
-                await self._publish_agent("", speech_final=True)
+                await self.close_agent_turn(force=True)
+
+            elif isinstance(frame, InterruptionFrame):
+                await self.close_agent_turn()
 
         await self.push_frame(frame, direction)
+
+    async def close_agent_turn(self, *, force: bool = False) -> None:
+        """Commit the reply in progress on the app. Idempotent unless forced."""
+        if not (self._open or force):
+            return
+        self._open = False
+        await self._publish_agent("", speech_final=True)
 
     async def publish_user_transcript(self, text: str) -> None:
         """Called by the brain when a user turn is recognised — spoken or typed."""

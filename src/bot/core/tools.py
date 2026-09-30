@@ -17,13 +17,19 @@ of seconds before it runs — long enough that the caller thinks the line went
 dead. Async tools do their waiting as ordinary non-blocking I/O instead.
 """
 
+import logging
 import os
 
 import httpx
 from langchain_core.tools import tool
 
+logger = logging.getLogger(__name__)
+
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 _TIMEOUT = float(os.getenv("BACKEND_TIMEOUT", "15"))
+# The backend only answers search for its own agent (or a signed-in user):
+# each search can spend a shared, rate-limited flight API budget.
+_HEADERS = {"X-Service-Token": os.getenv("BACKEND_SERVICE_TOKEN", "")}
 
 
 async def _post(path: str, payload: dict) -> list[dict]:
@@ -35,11 +41,30 @@ async def _post(path: str, payload: dict) -> list[dict]:
     """
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.post(f"{BACKEND_URL}{path}", json=payload)
-            resp.raise_for_status()
-            return resp.json()
+            resp = await client.post(
+                f"{BACKEND_URL}{path}", json=payload, headers=_HEADERS
+            )
     except httpx.HTTPError as exc:
-        return [{"error": f"search failed: {exc}"}]
+        # Logged in full here; the model — and so the app's card and the
+        # stored history — gets a sentence without our internal address in it.
+        logger.warning("search %s failed: %s", path, exc)
+        return [{"error": "The search service could not be reached."}]
+
+    if resp.status_code == 422:
+        # The model sent something malformed — a bad date, too many guests.
+        # Say what, so it can fix the call rather than give up.
+        try:
+            detail = [
+                f"{'.'.join(str(p) for p in e.get('loc', [])[1:])}: {e.get('msg')}"
+                for e in resp.json().get("detail", [])
+            ]
+        except (ValueError, AttributeError, TypeError):
+            detail = []
+        return [{"error": "Invalid search: " + ("; ".join(detail) or "check the inputs")}]
+    if resp.is_error:
+        logger.warning("search %s returned %s: %s", path, resp.status_code, resp.text[:200])
+        return [{"error": "The search service is unavailable right now."}]
+    return resp.json()
 
 
 @tool

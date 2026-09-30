@@ -4,17 +4,24 @@
 #   azure     — server-side STT (skip if you only ever run STT_MODE=device)
 #   elevenlabs— the voice (eleven_v3 TTS)
 #   livekit   — the room transport
+#
+# Everything pinned to the versions the voice loop was tested with. A floating
+# range here meant a fresh image resolved different langchain/anthropic
+# versions than the tested venv — a deploy is not the moment to find out.
 pipecat-ai[silero,azure,elevenlabs,livekit]==1.3.0
-livekit-api
+livekit-api==1.2.1
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-dotenv==1.0.1
-loguru
-aiohttp
+loguru==0.7.3
+aiohttp==3.14.3
 httpx==0.28.1
-langchain-core>=0.3
-langchain-anthropic>=0.3
-langgraph>=0.2.40
+langchain-core==1.6.3
+langchain-anthropic==1.7.2
+anthropic==1.7.0
+langgraph==1.2.11
+langgraph-checkpoint==4.2.0
+langgraph-prebuilt==1.1.0
 
 # Conversation state in Postgres rather than this process's memory, so a chat
 # can be resumed after a restart or from a second container.
@@ -22,3 +29,4 @@ langgraph>=0.2.40
 langgraph-checkpoint-postgres==3.1.2
 # psycopg's driver, prebuilt — the pure-python path needs libpq on the host.
 psycopg[binary]==3.3.6
+psycopg-pool==3.3.2

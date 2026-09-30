@@ -14,6 +14,7 @@ Trimmed from the ajimganj concierge: the multi-language translation path is
 dropped (BackPAC is English-first; add it back the same way if you need it).
 """
 
+import asyncio
 import logging
 
 from pipecat.frames.frames import EndTaskFrame, TTSSpeakFrame
@@ -55,7 +56,11 @@ def setup_user_aggregator_handlers(user_aggregator) -> None:
 
 
 def setup_event_handlers(
-    transport, worker, langgraph_processor=None, room_name: str | None = None
+    transport,
+    worker,
+    langgraph_processor=None,
+    room_name: str | None = None,
+    joined: "asyncio.Event | None" = None,
 ) -> None:
     """Wire the greeting and the stable-thread-id handoff on join.
 
@@ -74,6 +79,8 @@ def setup_event_handlers(
         if langgraph_processor and hasattr(langgraph_processor, "set_participant_id"):
             langgraph_processor.set_participant_id(thread_id)
 
+        if joined is not None:
+            joined.set()
         logger.info("participant joined room %s — greeting", room_name)
         await worker.queue_frame(TTSSpeakFrame(GREETING_MESSAGE))
 
@@ -91,4 +98,22 @@ def setup_event_handlers(
         if remaining:
             return
         logger.info("room %s is empty — ending the session", room_name)
+        await _end_once()
+
+    ended = False
+
+    async def _end_once() -> None:
+        nonlocal ended
+        if ended:
+            return
+        ended = True
         await worker.cancel()
+
+    @transport.event_handler("on_disconnected")
+    async def _on_disconnected(transport, *_args):
+        """The bot itself lost the room — kicked, the room closed, or the
+        network gave up. Nobody can hear this pipeline any more, so stop it
+        rather than let it hold an STT stream and a DB connection until the
+        15-minute idle timeout."""
+        logger.info("disconnected from room %s — ending the session", room_name)
+        await _end_once()

@@ -86,6 +86,18 @@ WELCOME_SETS = {
     "idle": IDLE_LINES,
 }
 
+#: Every line this module will ever synthesise. The HTTP routes are reachable
+#: through the backend without signing in (the welcome screen plays first), so
+#: anything outside this set is refused: otherwise `?text=` is free
+#: text-to-speech in our voice on our key, cached in memory without limit.
+ALLOWED_LINES: frozenset[str] = frozenset(
+    line for lines in WELCOME_SETS.values() for line in lines
+)
+
+
+class UnknownLine(LookupError):
+    """Asked to say something that is not one of our lines."""
+
 
 @dataclass(frozen=True)
 class Greeting:
@@ -170,6 +182,8 @@ async def get_greeting(text: str | None = None) -> Greeting:
     """
     voice_id = os.environ["ELEVENLABS_VOICE_ID"]
     line = text or random.choice(GREETINGS)
+    if line not in ALLOWED_LINES:
+        raise UnknownLine(line)
     key = (voice_id, line)
 
     if key in _cache:
